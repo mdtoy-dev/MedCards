@@ -1,8 +1,12 @@
-import { BeforeChangeHook } from "payload/dist/globals/config/types"
+import {
+  AfterChangeHook,
+  BeforeChangeHook,
+} from "payload/dist/globals/config/types"
 import { PRODUCT_CATEGORIES } from "../../config"
-import { CollectionConfig } from "payload/types"
+import { Access, CollectionConfig } from "payload/types"
 import { Product } from "../../payload-types"
 import { stripe } from "../../lib/stripe"
+import { User } from "payload/dist/auth"
 
 const addUser: BeforeChangeHook = async ({ req, data }) => {
   const user = req.user
@@ -10,50 +14,115 @@ const addUser: BeforeChangeHook = async ({ req, data }) => {
   return { ...data, user: user.id }
 }
 
+const syncUser: AfterChangeHook = async ({ req, doc }) => {
+  const fullUser = await req.payload.findByID({
+    collection: "users",
+    id: req.user.id,
+  })
+
+  if (fullUser && typeof fullUser === "object") {
+    const { products } = fullUser
+
+    const allIDs = [
+      ...(products?.map((product) =>
+        typeof product === "object" ? product.id : product
+      ) || []),
+    ]
+
+    const createdProductIDs = allIDs.filter(
+      (id, index) => allIDs.indexOf(id) === index
+    )
+
+    const dataToUpdate = [...createdProductIDs, doc.id]
+
+    await req.payload.update({
+      collection: "users",
+      id: fullUser.id,
+      data: {
+        products: dataToUpdate,
+      },
+    })
+  }
+}
+
+const iAdminOrHasAccess =
+  (): Access =>
+  ({ req: { user: _user } }) => {
+    const user = _user as User | undefined
+
+    if (!user) return false
+    if (user.role === "admin") return true
+
+    const userProductIDs = (user.products as any[] || []).reduce<Array<string>>(
+      (acc: string[], product: { id: any }) => {
+        if (!product) return acc
+        if (typeof product === "string") {
+          acc.push(product)
+        } else {
+          acc.push(product.id)
+        }
+        return acc
+      },
+      []
+    )
+    return {
+      id: {
+        in: userProductIDs
+      }
+    }
+  }
+
 export const Products: CollectionConfig = {
   slug: "products",
   admin: {
     useAsTitle: "name",
   },
-  access: {},
+  access: {
+    read: iAdminOrHasAccess(),
+    update: iAdminOrHasAccess(),
+    delete: iAdminOrHasAccess(),
+  },
   hooks: {
-    beforeChange: [addUser, async (args) => {
-      if(args.operation === 'create') {
-        const data = args.data as Product
-      
-        const createdProduct = await stripe.products.create({
-          name: data.name,
-          default_price_data: {
-            currency: 'GBP',
-            unit_amount: Math.round(data.price  * 100)
+    afterChange: [syncUser],
+    beforeChange: [
+      addUser,
+      async (args) => {
+        if (args.operation === "create") {
+          const data = args.data as Product
+
+          const createdProduct = await stripe.products.create({
+            name: data.name,
+            default_price_data: {
+              currency: "GBP",
+              unit_amount: Math.round(data.price * 100),
+            },
+          })
+
+          const updated: Product = {
+            ...data,
+            stripeId: createdProduct.id,
+            priceId: createdProduct.default_price as string,
           }
-        })
 
-        const updated: Product = {
-          ...data, 
-          stripeId: createdProduct.id,
-          priceId: createdProduct.default_price as string
+          return updated
+        } else if (args.operation === "update") {
+          const data = args.data as Product
+
+          const updatedProduct = await stripe.products.update(data.stripeId!, {
+            name: data.name,
+            default_price: data.priceId!,
+          })
+
+          const updated: Product = {
+            ...data,
+            stripeId: updatedProduct.id,
+            priceId: updatedProduct.default_price as string,
+          }
+
+          return updated
         }
-
-        return updated
-      } else if(args.operation === 'update') {
-        const data = args.data as Product
-
-        const updatedProduct = await stripe.products.update(data.stripeId!, {
-          name: data.name,
-          default_price: data.priceId!
-        })
-          
-       
-        const updated: Product = {
-          ...data,
-          stripeId: updatedProduct.id,
-          priceId: updatedProduct.default_price as string,
-        }
-
-        return updated
-      }
-    }],
+      },
+    ],
   },
   fields: [
     {
